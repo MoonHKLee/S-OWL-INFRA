@@ -2,10 +2,10 @@
 # More info: http://lono.cloud
 ---
 AWSTemplateFormatVersion: 2010-09-09
-Description: Example with ECS on Spot Fleets from BoltOps.
+Description: S-OWL's ecs spot cluster.
 Metadata:
   Authors:
-    Description: Tung Nguyen (tung@boltops.com)
+    Description: tpdns90321(Orginal. Tung Nguyen (tung@boltops.com))
   License: MIT
 Parameters:
   KeyName:
@@ -16,19 +16,23 @@ Parameters:
     Type: String
     Description: ECS Cluster
     Default: development
-  TargetCapacity:
+  BurstCapacity:
     Type: String
-    Description: TargetCapacity
-    Default: '8'
+    Description: BurstType Instance Capacity
+    Default: '2'
+  ComputeCapacity:
+    Type: String
+    Description: ComputeType Instance capacity
+    Default: '1'
   TagName:
     Type: String
     Description: TagName
-    Default: "ECS Spot Fleet Demo"
+    Default: "S-OWL"
   VpcName:
     Description: VPC name.
     Type: String
     ConstraintDescription: Must be a string.
-    Default: "demo vpc"
+    Default: "S-OWL ECS"
   SourceCidr:
     Default: 0.0.0.0/0
     Description: CIDR/IP range for instance ssh access - defaults to 0.0.0.0/0
@@ -40,7 +44,7 @@ Mappings:
     ap-northeast-1:
       Ami: ami-084cb340923dc7101
     ap-northeast-2:
-      Ami: ami-0e0d82e1272b5ae8a
+      Ami: ami-0accbb5aa909be7bf
     ap-south-1:
       Ami: ami-0d7805fed18723d71
     ap-southeast-1:
@@ -70,24 +74,28 @@ Mappings:
     us-west-2:
       Ami: ami-0d2f82a622136a696
 Resources:
-  SpotFleet:
+  ECS:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref EcsCluster
+  BurstSpotFleet:
     Type: AWS::EC2::SpotFleet
     Properties:
       SpotFleetRequestConfigData:
         IamFleetRole: !GetAtt IamFleetRole.Arn
-        TargetCapacity: !Ref TargetCapacity
+        TargetCapacity: !Ref BurstCapacity
+        AllocationStrategy: 'diversified'
         LaunchSpecifications:
   
         - EbsOptimized: 'false'
-          InstanceType: t3.small
-          WeightedCapacity: 2
+          InstanceType: t3a.small
           ImageId: !FindInMap
             - AmiMap
             - !Ref 'AWS::Region'
             - Ami
           KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
           SecurityGroups:
-          - GroupId: !Ref SecurityGroup
+          - GroupId: !Ref InstanceSecurityGroup
           Monitoring:
             Enabled: true
           UserData:
@@ -148,16 +156,231 @@ Resources:
             - Key: Name
               Value: !Ref TagName
 
-        - EbsOptimized: 'false'
-          InstanceType: t3.medium
-          WeightedCapacity: 4
+  ComputeSpotFleet:
+    Type: AWS::EC2::SpotFleet
+    Properties:
+      SpotFleetRequestConfigData:
+        IamFleetRole: !GetAtt IamFleetRole.Arn
+        TargetCapacity: !Ref ComputeCapacity
+        AllocationStrategy: 'diversified'
+        LaunchSpecifications:
+  
+        - EbsOptimized: 'true'
+          InstanceType: c4.large 
           ImageId: !FindInMap
             - AmiMap
             - !Ref 'AWS::Region'
             - Ami
           KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
           SecurityGroups:
-          - GroupId: !Ref SecurityGroup
+          - GroupId: !Ref InstanceSecurityGroup
+          Monitoring:
+            Enabled: true
+          UserData:
+            Fn::Base64: !Sub |
+              #!/bin/bash
+              
+              set -eux
+              mkdir -p /etc/ecs
+              echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+              export PATH=/usr/local/bin:$PATH
+              yum -y install jq
+              easy_install pip
+              pip install awscli
+              aws configure set default.region ${AWS::Region}
+              
+              cat <<EOF > /etc/init/spot-instance-termination-handler.conf
+              description "Start spot instance termination handler monitoring script"
+              author "BoltOps"
+              start on started ecs
+              script
+              echo \$\$ > /var/run/spot-instance-termination-handler.pid
+              exec /usr/local/bin/spot-instance-termination-handler.sh
+              end script
+              pre-start script
+              logger "[spot-instance-termination-handler.sh]: spot instance termination
+              notice handler started"
+              end script
+              EOF
+              
+              cat <<EOF > /usr/local/bin/spot-instance-termination-handler.sh
+              #!/bin/bash
+              while sleep 5; do
+              if [ -z \$(curl -Isf http://169.254.169.254/latest/meta-data/spot/termination-time)]; then
+              /bin/false
+              else
+              logger "[spot-instance-termination-handler.sh]: spot instance termination notice detected"
+              STATUS=DRAINING
+              ECS_CLUSTER=\$(curl -s http://localhost:51678/v1/metadata | jq .Cluster | tr -d \")
+              CONTAINER_INSTANCE=\$(curl -s http://localhost:51678/v1/metadata | jq .ContainerInstanceArn | tr -d \")
+              logger "[spot-instance-termination-handler.sh]: putting instance in state \$STATUS"
+              
+              /usr/local/bin/aws  ecs update-container-instances-state --cluster \$ECS_CLUSTER --container-instances \$CONTAINER_INSTANCE --status \$STATUS
+              
+              logger "[spot-instance-termination-handler.sh]: putting myself to sleep..."
+              sleep 120 # exit loop as instance expires in 120 secs after terminating notification
+              fi
+              done
+              EOF
+              
+              chmod +x /usr/local/bin/spot-instance-termination-handler.sh
+
+          IamInstanceProfile:
+            Arn: !GetAtt IamInstanceProfile.Arn
+          SubnetId: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+          TagSpecifications:
+          - ResourceType: "instance"
+            Tags:
+            - Key: Name
+              Value: !Ref TagName
+
+        - EbsOptimized: 'true'
+          InstanceType: m4.large 
+          ImageId: !FindInMap
+            - AmiMap
+            - !Ref 'AWS::Region'
+            - Ami
+          KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+          SecurityGroups:
+          - GroupId: !Ref InstanceSecurityGroup
+          Monitoring:
+            Enabled: true
+          UserData:
+            Fn::Base64: !Sub |
+              #!/bin/bash
+              
+              set -eux
+              mkdir -p /etc/ecs
+              echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+              export PATH=/usr/local/bin:$PATH
+              yum -y install jq
+              easy_install pip
+              pip install awscli
+              aws configure set default.region ${AWS::Region}
+              
+              cat <<EOF > /etc/init/spot-instance-termination-handler.conf
+              description "Start spot instance termination handler monitoring script"
+              author "BoltOps"
+              start on started ecs
+              script
+              echo \$\$ > /var/run/spot-instance-termination-handler.pid
+              exec /usr/local/bin/spot-instance-termination-handler.sh
+              end script
+              pre-start script
+              logger "[spot-instance-termination-handler.sh]: spot instance termination
+              notice handler started"
+              end script
+              EOF
+              
+              cat <<EOF > /usr/local/bin/spot-instance-termination-handler.sh
+              #!/bin/bash
+              while sleep 5; do
+              if [ -z \$(curl -Isf http://169.254.169.254/latest/meta-data/spot/termination-time)]; then
+              /bin/false
+              else
+              logger "[spot-instance-termination-handler.sh]: spot instance termination notice detected"
+              STATUS=DRAINING
+              ECS_CLUSTER=\$(curl -s http://localhost:51678/v1/metadata | jq .Cluster | tr -d \")
+              CONTAINER_INSTANCE=\$(curl -s http://localhost:51678/v1/metadata | jq .ContainerInstanceArn | tr -d \")
+              logger "[spot-instance-termination-handler.sh]: putting instance in state \$STATUS"
+              
+              /usr/local/bin/aws  ecs update-container-instances-state --cluster \$ECS_CLUSTER --container-instances \$CONTAINER_INSTANCE --status \$STATUS
+              
+              logger "[spot-instance-termination-handler.sh]: putting myself to sleep..."
+              sleep 120 # exit loop as instance expires in 120 secs after terminating notification
+              fi
+              done
+              EOF
+              
+              chmod +x /usr/local/bin/spot-instance-termination-handler.sh
+
+          IamInstanceProfile:
+            Arn: !GetAtt IamInstanceProfile.Arn
+          SubnetId: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+          TagSpecifications:
+          - ResourceType: "instance"
+            Tags:
+            - Key: Name
+              Value: !Ref TagName
+
+        - EbsOptimized: 'true'
+          InstanceType: c5.large 
+          ImageId: !FindInMap
+            - AmiMap
+            - !Ref 'AWS::Region'
+            - Ami
+          KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+          SecurityGroups:
+          - GroupId: !Ref InstanceSecurityGroup
+          Monitoring:
+            Enabled: true
+          UserData:
+            Fn::Base64: !Sub |
+              #!/bin/bash
+              
+              set -eux
+              mkdir -p /etc/ecs
+              echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+              export PATH=/usr/local/bin:$PATH
+              yum -y install jq
+              easy_install pip
+              pip install awscli
+              aws configure set default.region ${AWS::Region}
+              
+              cat <<EOF > /etc/init/spot-instance-termination-handler.conf
+              description "Start spot instance termination handler monitoring script"
+              author "BoltOps"
+              start on started ecs
+              script
+              echo \$\$ > /var/run/spot-instance-termination-handler.pid
+              exec /usr/local/bin/spot-instance-termination-handler.sh
+              end script
+              pre-start script
+              logger "[spot-instance-termination-handler.sh]: spot instance termination
+              notice handler started"
+              end script
+              EOF
+              
+              cat <<EOF > /usr/local/bin/spot-instance-termination-handler.sh
+              #!/bin/bash
+              while sleep 5; do
+              if [ -z \$(curl -Isf http://169.254.169.254/latest/meta-data/spot/termination-time)]; then
+              /bin/false
+              else
+              logger "[spot-instance-termination-handler.sh]: spot instance termination notice detected"
+              STATUS=DRAINING
+              ECS_CLUSTER=\$(curl -s http://localhost:51678/v1/metadata | jq .Cluster | tr -d \")
+              CONTAINER_INSTANCE=\$(curl -s http://localhost:51678/v1/metadata | jq .ContainerInstanceArn | tr -d \")
+              logger "[spot-instance-termination-handler.sh]: putting instance in state \$STATUS"
+              
+              /usr/local/bin/aws  ecs update-container-instances-state --cluster \$ECS_CLUSTER --container-instances \$CONTAINER_INSTANCE --status \$STATUS
+              
+              logger "[spot-instance-termination-handler.sh]: putting myself to sleep..."
+              sleep 120 # exit loop as instance expires in 120 secs after terminating notification
+              fi
+              done
+              EOF
+              
+              chmod +x /usr/local/bin/spot-instance-termination-handler.sh
+
+          IamInstanceProfile:
+            Arn: !GetAtt IamInstanceProfile.Arn
+          SubnetId: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+          TagSpecifications:
+          - ResourceType: "instance"
+            Tags:
+            - Key: Name
+              Value: !Ref TagName
+
+        - EbsOptimized: 'true'
+          InstanceType: m5.large 
+          ImageId: !FindInMap
+            - AmiMap
+            - !Ref 'AWS::Region'
+            - Ami
+          KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+          SecurityGroups:
+          - GroupId: !Ref InstanceSecurityGroup
           Monitoring:
             Enabled: true
           UserData:
@@ -254,14 +477,20 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId:
         Ref: InternetGateway
-  SecurityGroup:
+
+  LoadBalancerSecurityGroup:
+    Properties:
+      GroupDescription: target load balancer
+      VpcId: !Ref Vpc
+    Type: AWS::EC2::SecurityGroup
+  InstanceSecurityGroup:
     Properties:
       GroupDescription: Spot fleet instance Security Group
       SecurityGroupIngress:
-      - CidrIp: !Ref SourceCidr
-        FromPort: 22
+      - SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
         IpProtocol: tcp
-        ToPort: 22
+        FromPort: 49153
+        ToPort: 65535
       VpcId: !Ref Vpc
     Type: AWS::EC2::SecurityGroup
 
@@ -288,7 +517,7 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.30.32.0/19
-      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      AvailabilityZone: !Select [ 2, !GetAZs '' ]
       MapPublicIpOnLaunch: true
       Tags:
       - Key: vpc_name
