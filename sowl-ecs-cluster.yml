@@ -455,6 +455,10 @@ Resources:
         IpProtocol: tcp
         FromPort: 0 
         ToPort: 65535
+      - CidrIp: '10.30.0.0/16'
+        IpProtocol: tcp
+        FromPort: 0 
+        ToPort: 65535
       VpcId: !Ref Vpc
     Type: AWS::EC2::SecurityGroup
 
