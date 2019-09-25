@@ -66,3 +66,4 @@ Delete the ECR repo:
 Delete the infrastructure CloudFormation stack:
 
     aws cloudformation delete-stack --stack-name ecs-spot-demo
+hahahahahahahahahahahahahaha
